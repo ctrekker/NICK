@@ -3,9 +3,12 @@
 
 use clap::{App, SubCommand, Arg, ArgMatches};
 use rusqlite::{params, Connection};
-use std::fs;
+use std::{fs, thread};
 use std::path::Path;
 use std::error::Error;
+use std::net::{TcpListener, TcpStream, Shutdown};
+use std::io::{Read, Write};
+use std::sync::{Mutex, Arc, MutexGuard};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let db: Connection = (init_database()?).unwrap();
@@ -37,6 +40,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .short("p")
                 .long("project")
                 .help("Serves project based on name. Mutually exclusive with global")))
+        .subcommand(SubCommand::with_name("server")
+            .about("Manage internal server")
+            .subcommand(SubCommand::with_name("start")
+                .about("Starts the internal server"))
+            .subcommand(SubCommand::with_name("status")
+                .about("Gets current status of the internal server")
+                .arg(Arg::with_name("remote")
+                    .help("Name of remote to check status of")
+                    .value_name("REMOTE")
+                    .index(1))))
         .subcommand(SubCommand::with_name("remotes")
             .about("Manages the remote locations with which to sync")
             .subcommand(SubCommand::with_name("add")
@@ -85,9 +98,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         .subcommand(SubCommand::with_name("sync")
             .about("Syncs current code repo with remotes. Defaults to all remotes")
             .subcommand(SubCommand::with_name("up")
-                .about("Syncs local code up to remote code. Overrides remote code"))
+                .about("Syncs local code up to remote code. Overrides remote code")
+                .arg(Arg::with_name("remote")
+                    .help("Name of the remote to sync code to")
+                    .value_name("REMOTE")
+                    .required(true)
+                    .index(1)))
             .subcommand(SubCommand::with_name("down")
-                .about("Syncs remote code down to local code. Overrides local code")))
+                .about("Syncs remote code down to local code. Overrides local code")
+                .arg(Arg::with_name("remote")
+                    .help("Name of the remote to sync code from")
+                    .value_name("REMOTE")
+                    .required(true)
+                    .index(1))))
         .get_matches();
 
     if let Some(matches) = matches.subcommand_matches("init") {
@@ -107,8 +130,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             remotes_delete(&db, matches)?;
         }
     }
-
-
+    if let Some(matches) = matches.subcommand_matches("sync") {
+        if let Some(matches) = matches.subcommand_matches("up") {
+            sync_up(&db, matches)?;
+        }
+        if let Some(matches) = matches.subcommand_matches("down") {
+            sync_down(&db, matches)?;
+        }
+    }
+    if let Some(matches) = matches.subcommand_matches("server") {
+        if let Some(matches) = matches.subcommand_matches("start") {
+            server_start(&db, matches)?;
+        }
+        if let Some(matches) = matches.subcommand_matches("status") {
+            server_status(&db, matches)?;
+        }
+    }
     return Ok(());
 }
 
@@ -326,8 +363,108 @@ fn remotes_delete(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn E
 
     Ok(())
 }
+fn sync_up(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+fn sync_down(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+fn server_start(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
+    let listener = TcpListener::bind("0.0.0.0:13931")?;
+    let db_arc = Arc::new(Mutex::new(db));
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let addr = stream.peer_addr()?;
+                println!("{} established", addr);
+                thread::spawn(move|| {
+                    let db_local = Connection::open(format!("{}/.nick/nick.db", dirs::home_dir().unwrap().to_str().unwrap())).unwrap();
+                    handle_server_client(&db_local, stream);
+                    println!("{} closed", addr);
+                });
+            }
+            Err(e) => {
+                println!("ERROR: Connection to client failed: {}", e);
+            }
+        }
+    }
+
+    Ok(())
+}
+fn server_status(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
+    let remote = matches.value_of("remote").unwrap_or("");
+    if remote == "" {
+        println!("ERROR: Remote name must be provided");
+        return Ok(());
+    }
+    let url = get_remote_url_by_name(db, remote)?;
+    match TcpStream::connect(format!("{}:13931", url)) {
+        Ok(mut stream) => {
+            let mut command = [0 as u8];
+            stream.write_all(&mut command);
+            let mut response = [0 as u8];
+
+            match stream.read_exact(&mut response) {
+                Ok(_) => {
+                    println!("Status: ON");
+                    return Ok(());
+                },
+                Err(e) => {
+                    println!("Status: OFF ({})", e.description());
+                    return Ok(());
+                }
+            }
+        },
+        Err(e) => {
+            println!("Status: OFF ({})", e.description());
+            return Ok(());
+        }
+    }
+}
 
 
+/*
+Server command reference:
+Receive:
+0 -> Status
+1 -> Sync up (client perspective)
+2 -> Sync down (client perspective)
+Send:
+0 -> Ok
+1 -> Error: Unknown command
+*/
+fn handle_server_stream_close(mut stream: TcpStream) {
+    stream.shutdown(Shutdown::Both).unwrap();
+}
+fn handle_server_client(db: &Connection, mut stream: TcpStream) {
+    let mut command = [0 as u8; 1];
+    match stream.read_exact(&mut command) {
+        Ok(_) => {
+            match command[0] {
+                0 => handle_server_status(db, stream),
+                1 => handle_server_sync_up(db, stream),
+                2 => handle_server_sync_down(db, stream),
+                _ => {
+                    stream.write(&[1 as u8]).unwrap();
+                }
+            }
+        },
+        Err(_) => {
+            handle_server_stream_close(stream);
+            return ();
+        }
+    }
+}
+fn handle_server_status(db: &Connection, mut stream: TcpStream) {
+    stream.write(&[0 as u8]).unwrap();
+    handle_server_stream_close(stream);
+}
+fn handle_server_sync_up(db: &Connection, mut stream: TcpStream) {
+
+}
+fn handle_server_sync_down(db: &Connection, mut stream: TcpStream) {
+
+}
 fn get_current_project_id(db: &Connection, suppress_warnings: bool) -> Result<i64, Box<dyn Error>> {
     let current_dir = std::env::current_dir()?;
     let current_dir = fs::canonicalize(&current_dir)?;
@@ -363,4 +500,15 @@ fn get_current_project_id(db: &Connection, suppress_warnings: bool) -> Result<i6
     }
 
     return Ok(lowest_parent_id);
+}
+fn get_remote_url_by_name(db: &Connection, name: &str) -> Result<String, Box<dyn Error>> {
+    let sql = "SELECT url FROM remotes WHERE name = ?1";
+    let mut stmt = db.prepare(sql)?;
+    return match stmt.query_row(params![name], |row| {
+        let u: String = row.get("url")?;
+        return Ok(u);
+    }) {
+        Ok(url) => Ok(url),
+        Err(_) => Ok("".to_string())
+    }
 }
