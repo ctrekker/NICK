@@ -6,7 +6,6 @@ use rusqlite::{params, Connection};
 use std::fs;
 use std::path::Path;
 use std::error::Error;
-use std::collections::HashMap;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let db: Connection = (init_database()?).unwrap();
@@ -60,7 +59,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .subcommand(SubCommand::with_name("update")
                 .about("Modifies a remote")
                 .arg(Arg::with_name("name")
-                    .help("Name of the remote. Used for identification only")
+                    .help("Name of the remote to modify")
                     .value_name("NAME")
                     .required(true)
                     .index(1))
@@ -77,7 +76,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .value_name("NEW_URL")
                     .help("New url for the remote")))
             .subcommand(SubCommand::with_name("delete")
-                .about("Deletes a remote")))
+                .about("Deletes a remote")
+                .arg(Arg::with_name("name")
+                    .help("Name of the remote to delete")
+                    .value_name("NAME")
+                    .required(true)
+                    .index(1))))
         .subcommand(SubCommand::with_name("sync")
             .about("Syncs current code repo with remotes. Defaults to all remotes")
             .subcommand(SubCommand::with_name("up")
@@ -103,6 +107,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             remotes_delete(&db, matches)?;
         }
     }
+
 
     return Ok(());
 }
@@ -155,7 +160,7 @@ fn init(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
     let full_path = fs::canonicalize(&path)?;
     let full_path = full_path.to_str().unwrap();
     let sql = "INSERT INTO projects (path, alias) VALUES (?1, ?2)";
-    if let Err(e) = db.execute(sql, params![full_path, matches.value_of("alias")]) {
+    if let Err(_e) = db.execute(sql, params![full_path, matches.value_of("alias")]) {
         println!("ERROR: Project already exists at {}", full_path);
         return Ok(());
     }
@@ -164,8 +169,8 @@ fn init(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 fn remotes_add(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
-    let mut name = "";
-    let mut url = "";
+    let name;
+    let url;
     match matches.value_of("name") {
         Some(name_local) => {
             name = name_local;
@@ -229,19 +234,24 @@ fn remotes_list(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Err
 
     fn repeat_char(c: &str, n: usize) -> String {
         let mut out = String::new();
-        for i in 0..n {
+        for _i in 0..n {
             out.push_str(c);
         }
         return out;
     }
 
     if !matches.is_present("simple") {
-        println!("name{}url", repeat_char(" ", max_name_len));
-        println!("{}", repeat_char("-", max_name_len + 4 + max_url_len));
-        for i in 0..names.len() {
-            let name = &names[i];
-            let url = &urls[i];
-            println!("{}{}{}", name, repeat_char(" ", max_name_len - name.len() + 4), url);
+        if names.len() == 0 {
+            println!("No remotes configured");
+        }
+        else {
+            println!("name{}url", repeat_char(" ", max_name_len));
+            println!("{}", repeat_char("-", max_name_len + 4 + max_url_len));
+            for i in 0..names.len() {
+                let name = &names[i];
+                let url = &urls[i];
+                println!("{}{}{}", name, repeat_char(" ", max_name_len - name.len() + 4), url);
+            }
         }
     }
     else {
@@ -255,7 +265,7 @@ fn remotes_list(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Err
     Ok(())
 }
 fn remotes_update(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
-    let mut name = "";
+    let name;
     match matches.value_of("name") {
         Some(name_local) => name = name_local,
         None => {
@@ -263,17 +273,17 @@ fn remotes_update(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn E
             return Ok(());
         }
     }
-    let mut new_name = matches.value_of("new_name").unwrap_or(name);
-    let mut new_url = matches.value_of("new_url").unwrap_or("");
+    let new_name = matches.value_of("new_name").unwrap_or(name);
+    let new_url = matches.value_of("new_url").unwrap_or("");
 
     let mut stmt = db.prepare("SELECT url FROM remotes WHERE name = ?1")?;
-    let mut url: String = String::new();
+    let mut url: String;
     match stmt.query_row(params![name], |row| {
         let u: String = row.get("url")?;
         return Ok(u);
     }) {
         Ok(url_local) => url = url_local,
-        Err(e) => {
+        Err(_e) => {
             println!("ERROR: Remote '{}' does not exist", name);
             return Ok(());
         }
@@ -300,7 +310,19 @@ fn remotes_update(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn E
     Ok(())
 }
 fn remotes_delete(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
+    let name = matches.value_of("name").unwrap_or("");
+    if name == "" {
+        println!("ERROR: Remote name must be provided");
+    }
 
+    if let Ok(result) = db.execute("DELETE FROM remotes WHERE name = ?1", params![name]) {
+        if result == 0 {
+            println!("ERROR: Remote '{}' does not exist", name);
+        }
+        else {
+            println!("Deleted remote '{}'", name);
+        }
+    }
 
     Ok(())
 }
