@@ -7,10 +7,31 @@ use std::{fs, thread};
 use std::path::Path;
 use std::error::Error;
 use std::net::{TcpListener, TcpStream, Shutdown};
-use std::io::{Read, Write};
+use std::io::{Read, Write, BufReader, BufWriter};
 use std::sync::{Mutex, Arc, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs::File;
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use flate2::read::GzDecoder;
+use byte::{BytesExt, BE};
+use data_encoding::HEXUPPER;
+use byte::ctx::{Str, NULL};
+use ring::digest::{Context, Digest, SHA256};
+use tar::Archive;
 
+fn unpack() -> Result<(), Box<dyn Error>>  {
+    let data = File::open("/Users/cburns/.nick/tmp/1562191683833.tar.gz")?;
+    let decompressed = GzDecoder::new(data);
+    let mut archive = Archive::new(decompressed);
+    archive.unpack("/Users/cburns/Documents/Programming/Grapher")?;
+
+    Ok(())
+}
 fn main() -> Result<(), Box<dyn Error>> {
+//    unpack()?;
+//    return Ok(());
+
     let db: Connection = (init_database()?).unwrap();
     let matches = App::new("NICK")
         .version(env!("CARGO_PKG_VERSION"))
@@ -24,12 +45,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .takes_value(true)
                 .value_name("PATH")
                 .help("Path of the project root. Defaults to PWD (present working directory)"))
-            .arg(Arg::with_name("alias")
-                .short("a")
-                .long("alias")
+            .arg(Arg::with_name("name")
+                .short("n")
+                .long("name")
                 .takes_value(true)
-                .value_name("ALIAS")
-                .help("Aliased project name. Used for remote access to project without knowing local path")))
+                .value_name("NAME")
+                .help("Name of project. Used for remote access to project")))
         .subcommand(SubCommand::with_name("serve")
             .about("Serves project(s) code on server")
             .arg(Arg::with_name("global")
@@ -103,7 +124,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .help("Name of the remote to sync code to")
                     .value_name("REMOTE")
                     .required(true)
-                    .index(1)))
+                    .index(1))
+                .arg(Arg::with_name("project")
+                    .help("Name for project on remote. Defaults to current project's name")
+                    .short("p")
+                    .long("project")
+                    .takes_value(true)
+                    .value_name("PROJECT")))
             .subcommand(SubCommand::with_name("down")
                 .about("Syncs remote code down to local code. Overrides local code")
                 .arg(Arg::with_name("remote")
@@ -163,6 +190,12 @@ fn init_database() -> Result<Option<Connection>, Box<dyn Error>> {
             url TEXT NOT NULL,
             created_date TIMESTAMP NOT NULL DEFAULT (datetime('now', 'localtime')),
             last_modified TIMESTAMP NOT NULL DEFAULT (datetime('now', 'localtime'))
+        )",
+        "CREATE TABLE IF NOT EXISTS backups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project INTEGER NOT NULL,
+            created_date TIMESTAMP NOT NULL DEFAULT (datetime('now', 'localtime')),
+            FOREIGN KEY(project) REFERENCES projects(id)
         )"
     ];
     if let Some(home_dir) = dirs::home_dir() {
@@ -170,6 +203,7 @@ fn init_database() -> Result<Option<Connection>, Box<dyn Error>> {
         nick_home.push_str(home_dir.to_str().unwrap());
         nick_home.push_str("/.nick");
         fs::create_dir(&nick_home).unwrap_or(());
+        fs::create_dir(format!("{}/tmp", nick_home)).unwrap_or(());
 
         let mut db_path_str = String::new();
         db_path_str.push_str(nick_home.as_str());
@@ -197,7 +231,7 @@ fn init(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
     let full_path = fs::canonicalize(&path)?;
     let full_path = full_path.to_str().unwrap();
     let sql = "INSERT INTO projects (path, alias) VALUES (?1, ?2)";
-    if let Err(_e) = db.execute(sql, params![full_path, matches.value_of("alias")]) {
+    if let Err(_e) = db.execute(sql, params![full_path, matches.value_of("name")]) {
         println!("ERROR: Project already exists at {}", full_path);
         return Ok(());
     }
@@ -364,6 +398,97 @@ fn remotes_delete(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn E
     Ok(())
 }
 fn sync_up(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
+    let filename = format!("{}", SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis());
+    let tmp_file = format!("{}/{}.tar.gz", get_temp_path(), filename);
+
+    let mut project_root: String = get_current_project("path", db, false)?;
+    let mut project_name = get_current_project("name", db, true)?;
+    if matches.is_present("project") {
+        project_name = matches.value_of("project").unwrap().to_string();
+        let mut stmt = db.prepare("SELECT path FROM projects WHERE alias = ?1")?;
+        match stmt.query_row(params![project_name], |row| {
+            let tmp: String = row.get("path")?;
+            return Ok(tmp);
+        }) {
+            Ok(project_root_local) => {
+                project_root = project_root_local;
+            },
+            Err(_) => {
+                println!("ERROR: Project '{}' does not exist", project_name);
+            }
+        };
+    }
+
+    println!("Compressing project '{}'", project_name);
+    {
+        let mut archive = File::create(tmp_file.clone())?;
+        let encoder = GzEncoder::new(&archive, Compression::default());
+        let mut tar = tar::Builder::new(encoder);
+        tar.append_dir_all(".", project_root.as_str())?;
+        tar.finish()?;
+    }
+
+//    return Ok(());
+
+    let remote = matches.value_of("remote").unwrap();
+    println!("Connecting to '{}'", remote);
+    match server_remote_connect(db, remote.to_string()) {
+        Ok(mut stream) => {
+            println!("Syncing project up...");
+            let mut archive_file = File::open(&tmp_file)?;
+            archive_file.sync_all()?;
+            let filesize = archive_file.metadata()?.len();
+
+            stream.write_all(&mut [1u8]);
+
+            let mut project_name_arr = project_name.as_bytes();
+
+            let mut project_name_len_arr = &mut [0u8; 4];
+            project_name_len_arr.write_with::<u32>(&mut 0, project_name_arr.len() as u32, BE).unwrap();
+            stream.write_all(project_name_len_arr);
+            stream.write_all(project_name_arr);
+
+            let mut filesize_arr = &mut [0u8; 8];
+            let mut offset = &mut 0;
+            filesize_arr.write_with::<u64>(offset, filesize, BE).unwrap();
+            stream.write_all(filesize_arr);
+
+            let digest = sha256_digest(File::open(&tmp_file)?)?;
+            let mut digest = digest.as_ref();
+            stream.write_all(&mut digest);
+            stream.flush();
+
+            let mut buf = [0u8; 1024];
+
+            loop {
+                let count = archive_file.read(&mut buf)?;
+                if count == 0 {
+                    break;
+                }
+                stream.write(&mut buf[..count])?;
+            }
+            stream.flush();
+
+            let response = &mut [0u8];
+            stream.read_exact(response);
+            if response[0] == 2 {
+                println!("ERROR: Invalid checksum from remote");
+                return Ok(());
+            }
+            else if response[0] != 0 {
+                println!("ERROR: Remote responded with unknown error code");
+                return Ok(());
+            }
+
+            println!("Sync completed");
+        },
+        Err(_) => {
+            println!("ERROR: Could not connect to remote '{}' ({})", remote, get_remote_url_by_name(db, remote)?);
+        }
+    }
+
+//    fs::remove_file(tmp_file);
+
     Ok(())
 }
 fn sync_down(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
@@ -432,6 +557,7 @@ Receive:
 Send:
 0 -> Ok
 1 -> Error: Unknown command
+2 -> Error: Bad checksum
 */
 fn handle_server_stream_close(mut stream: TcpStream) {
     stream.shutdown(Shutdown::Both).unwrap();
@@ -440,32 +566,138 @@ fn handle_server_client(db: &Connection, mut stream: TcpStream) {
     let mut command = [0 as u8; 1];
     match stream.read_exact(&mut command) {
         Ok(_) => {
-            match command[0] {
+            println!("COMMAND: {:?}", command);
+            let result = match command[0] {
                 0 => handle_server_status(db, stream),
                 1 => handle_server_sync_up(db, stream),
                 2 => handle_server_sync_down(db, stream),
                 _ => {
                     stream.write(&[1 as u8]).unwrap();
+                    Ok(())
                 }
+            };
+            if let Err(e) = result {
+                println!("ERROR: {}", e.to_string());
             }
         },
-        Err(_) => {
+        Err(e) => {
+            println!("ERROR: {}", e.to_string());
             handle_server_stream_close(stream);
             return ();
         }
     }
 }
-fn handle_server_status(db: &Connection, mut stream: TcpStream) {
+fn handle_server_status(db: &Connection, mut stream: TcpStream) -> Result<(), Box<dyn Error>> {
     stream.write(&[0 as u8]).unwrap();
     handle_server_stream_close(stream);
-}
-fn handle_server_sync_up(db: &Connection, mut stream: TcpStream) {
 
+    Ok(())
 }
-fn handle_server_sync_down(db: &Connection, mut stream: TcpStream) {
+fn handle_server_sync_up(db: &Connection, mut stream: TcpStream) -> Result<(), Box<dyn Error>> {
+    let filename = format!("{}", SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis());
+    let tmp_file = format!("{}/{}.tar.gz", get_temp_path(), filename);
+    let tmp_dir = get_temp_path();
 
+    let project_name_len_arr = &mut [0u8; 4];
+    stream.read_exact(project_name_len_arr)?;
+    let project_name_len = project_name_len_arr.read_with::<u32>(&mut 0, BE).unwrap();
+
+    let mut project_name_arr = vec![0u8; project_name_len as usize];
+    let project_name_arr = project_name_arr.as_mut_slice();
+    stream.read_exact(project_name_arr)?;
+    let project_name = std::str::from_utf8(project_name_arr)?;
+
+    let filesize_arr = &mut [0u8; 8];
+    stream.read_exact(filesize_arr)?;
+    let filesize = filesize_arr.read_with::<u64>(&mut 0, BE).unwrap();
+
+    let mut hash_arr = [0u8; 32];
+    stream.read_exact(&mut hash_arr)?;
+
+    {
+        let mut out_file = File::create(&tmp_file)?;
+        let mut count = filesize;
+        let mut buf = [0u8; 1024];
+        let mut context = Context::new(&SHA256);
+        loop {
+            let read = stream.read(&mut buf)?;
+            count -= read as u64;
+            let contents = &buf[..read];
+            context.update(contents);
+            out_file.write(contents);
+            if count == 0 {
+                break;
+            }
+        }
+        let digest = context.finish();
+        let mut calculated_hash = digest.as_ref();
+        if !calculated_hash.eq(&hash_arr) {
+            println!("WARNING: Bad checksum");
+            stream.write(&[2u8]);
+            fs::remove_file(&tmp_file)?;
+            stream.flush();
+            handle_server_stream_close(stream);
+            return Ok(());
+        }
+    }
+
+    let mut stmt = db.prepare("SELECT id, path FROM projects WHERE alias = ?1")?;
+    let mut project_id: u32 = 0;
+    let mut project_path: String = String::new();
+    stmt.query_row(params![project_name], |row| {
+        project_id = row.get("id")?;
+        project_path = row.get("path")?;
+        return Ok(());
+    })?;
+    db.execute("INSERT INTO backups (project) VALUES (?1)", params![project_id]);
+    let mut backup_id: u32 = 0;
+    db.query_row("SELECT id FROM backups WHERE project = ?1 ORDER BY created_date DESC LIMIT 1", params![project_id], |row| {
+        backup_id = row.get("id")?;
+        return Ok(());
+    })?;
+
+    let backup_path = format!("{}/backups/{}", get_data_path(), project_id);
+    fs::create_dir_all(&backup_path).unwrap_or(());
+    let backup_file_path = format!("{}/{}.tar.gz", &backup_path, backup_id);
+
+    let mut backup_archive = File::create(&backup_file_path)?;
+    let encoder = GzEncoder::new(&backup_archive, Compression::default());
+    let mut backup_tar = tar::Builder::new(encoder);
+    backup_tar.append_dir_all(".", project_path.as_str())?;
+    backup_tar.finish()?;
+
+    let mut stmt = db.prepare("SELECT id FROM backups WHERE project = ?1 ORDER BY created_date DESC")?;
+    let mut backups_results = stmt.query(params![project_id])?;
+    let mut backup_count = 0;
+    while let Some(backup_result) = backups_results.next()? {
+        backup_count += 1;
+        if backup_count > 5 {
+            let backup_id_iter: u32 = backup_result.get("id")?;
+            db.execute("DELETE FROM backups WHERE id = ?1", params![backup_id_iter])?;
+            fs::remove_file(format!("{}/{}.tar.gz", &backup_path, backup_id_iter)).unwrap_or(());
+        }
+    }
+
+    fs::remove_dir_all(&project_path).unwrap_or(());
+    fs::create_dir_all(&project_path).unwrap_or(());
+
+    println!("TMP FILE: {}", tmp_file);
+    println!("PROJECT PATH: {}", project_path);
+
+    let out_file2 = File::open(&tmp_file)?;
+    let decoder = GzDecoder::new(out_file2);
+    let mut archive = Archive::new(decoder);
+    archive.unpack(&project_path)?;
+
+    stream.write(&[0u8]);
+    stream.flush()?;
+
+    Ok(())
 }
-fn get_current_project_id(db: &Connection, suppress_warnings: bool) -> Result<i64, Box<dyn Error>> {
+fn handle_server_sync_down(db: &Connection, mut stream: TcpStream) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+fn get_current_project(prop: &str, db: &Connection, suppress_warnings: bool) -> Result<String, Box<dyn Error>> {
     let current_dir = std::env::current_dir()?;
     let current_dir = fs::canonicalize(&current_dir)?;
     let current_dir_str = current_dir.to_str().unwrap().to_string();
@@ -475,13 +707,16 @@ fn get_current_project_id(db: &Connection, suppress_warnings: bool) -> Result<i6
 
     let mut parent_paths = vec![];
     let mut lowest_parent_path = String::new();
+    let mut lowest_parent_name = String::new();
     let mut lowest_parent_id: i64 = -1;
     while let Some(row) = results.next()? {
         let project_path: String = row.get("path")?;
+        let project_name: String = row.get("alias")?;
         let project_id: i64 = row.get("id")?;
         if current_dir_str.contains(project_path.as_str()) {
             if lowest_parent_path.len() < project_path.len() {
                 lowest_parent_path = project_path.clone();
+                lowest_parent_name = project_name.clone();
                 lowest_parent_id = project_id;
             }
             parent_paths.push(project_path.clone());
@@ -499,7 +734,22 @@ fn get_current_project_id(db: &Connection, suppress_warnings: bool) -> Result<i6
         }
     }
 
-    return Ok(lowest_parent_id);
+    match prop {
+        "path" => return Ok(lowest_parent_path),
+        "name" => return Ok(lowest_parent_name),
+        _ => return Ok(lowest_parent_id.to_string())
+    }
+}
+fn server_remote_connect(db: &Connection, remote: String) -> Result<TcpStream, Box<dyn Error>> {
+    let url = get_remote_url_by_name(db, remote.as_str())?;
+    match TcpStream::connect(format!("{}:13931", url)) {
+        Ok(mut stream) => {
+            return Ok(stream);
+        },
+        Err(e) => {
+            return Err(Box::new(e));
+        }
+    }
 }
 fn get_remote_url_by_name(db: &Connection, name: &str) -> Result<String, Box<dyn Error>> {
     let sql = "SELECT url FROM remotes WHERE name = ?1";
@@ -511,4 +761,25 @@ fn get_remote_url_by_name(db: &Connection, name: &str) -> Result<String, Box<dyn
         Ok(url) => Ok(url),
         Err(_) => Ok("".to_string())
     }
+}
+fn get_data_path() -> String {
+    let home = dirs::home_dir().unwrap();
+    return format!("{}/.nick", home.to_str().unwrap());
+}
+fn get_temp_path() -> String {
+    return format!("{}/tmp", get_data_path());
+}
+fn sha256_digest<R: Read>(mut reader: R) -> Result<Digest, Box<dyn Error>> {
+    let mut context = Context::new(&SHA256);
+    let mut buffer = [0; 1024];
+
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        context.update(&buffer[..count]);
+    }
+
+    Ok(context.finish())
 }
