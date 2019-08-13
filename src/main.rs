@@ -1,7 +1,7 @@
 // NICK - New Integrated Context Karyover
 //   The acronym sucks, and so does the workflow
 
-use clap::{App, SubCommand, Arg, ArgMatches};
+use clap::{App, SubCommand, Arg, ArgMatches, AppSettings};
 use rusqlite::{params, Connection};
 use std::{fs, thread};
 use std::path::Path;
@@ -35,6 +35,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let db: Connection = (init_database()?).unwrap();
     let matches = App::new("NICK")
+        .setting(AppSettings::ArgRequiredElseHelp)
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))
         .about("New Integrated Context Karyover")
@@ -52,17 +53,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .takes_value(true)
                 .value_name("NAME")
                 .help("Name of project. Used for remote access to project")))
-        .subcommand(SubCommand::with_name("serve")
-            .about("Serves project(s) code on server")
-            .arg(Arg::with_name("global")
-                .short("g")
-                .long("global")
-                .help("Serves all initialized projects on local machine. Mutually exclusive with project"))
-            .arg(Arg::with_name("project")
-                .short("p")
-                .long("project")
-                .help("Serves project based on name. Mutually exclusive with global")))
         .subcommand(SubCommand::with_name("server")
+            .setting(AppSettings::ArgRequiredElseHelp)
             .about("Manage internal server")
             .subcommand(SubCommand::with_name("start")
                 .about("Starts the internal server"))
@@ -73,6 +65,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .value_name("REMOTE")
                     .index(1))))
         .subcommand(SubCommand::with_name("remotes")
+            .setting(AppSettings::ArgRequiredElseHelp)
             .about("Manages the remote locations with which to sync")
             .subcommand(SubCommand::with_name("add")
                 .about("Creates a new remote")
@@ -118,6 +111,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .required(true)
                     .index(1))))
         .subcommand(SubCommand::with_name("sync")
+            .setting(AppSettings::ArgRequiredElseHelp)
             .about("Syncs current code repo with remotes. Defaults to all remotes")
             .subcommand(SubCommand::with_name("up")
                 .about("Syncs local code up to remote code. Overrides remote code")
