@@ -6,11 +6,11 @@ use rusqlite::{params, Connection};
 use std::{fs, thread};
 use std::path::Path;
 use std::error::Error;
-use std::net::{TcpListener, TcpStream, Shutdown};
+use std::net::{TcpListener, TcpStream, Shutdown, SocketAddr};
 use std::io::{Read, Write, BufReader, BufWriter};
 use std::sync::{Mutex, Arc, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::fs::File;
+use std::fs::{File, Metadata};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use flate2::read::GzDecoder;
@@ -19,6 +19,7 @@ use data_encoding::HEXUPPER;
 use byte::ctx::{Str, NULL};
 use ring::digest::{Context, Digest, SHA256};
 use tar::Archive;
+use std::thread::JoinHandle;
 
 fn unpack() -> Result<(), Box<dyn Error>>  {
     let data = File::open("/Users/cburns/.nick/tmp/1562191683833.tar.gz")?;
@@ -137,7 +138,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .help("Name of the remote to sync code from")
                     .value_name("REMOTE")
                     .required(true)
-                    .index(1))))
+                    .index(1))
+                .arg(Arg::with_name("project")
+                    .help("Name for project on remote. Defaults to current project's name")
+                    .short("p")
+                    .long("project")
+                    .takes_value(true)
+                    .value_name("PROJECT"))))
         .get_matches();
 
     if let Some(matches) = matches.subcommand_matches("init") {
@@ -159,7 +166,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if let Some(matches) = matches.subcommand_matches("sync") {
         if let Some(matches) = matches.subcommand_matches("up") {
-            sync_up(&db, matches)?;
+            sync_up(&db, Some(matches), None, None)?;
         }
         if let Some(matches) = matches.subcommand_matches("down") {
             sync_down(&db, matches)?;
@@ -167,7 +174,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if let Some(matches) = matches.subcommand_matches("server") {
         if let Some(matches) = matches.subcommand_matches("start") {
-            server_start(&db, matches)?;
+            server_start(&db, matches, 13931, false, ||{})?;
         }
         if let Some(matches) = matches.subcommand_matches("status") {
             server_status(&db, matches)?;
@@ -227,11 +234,22 @@ fn init(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
             path = Path::new(provided_path).to_path_buf();
         }
     }
+    let mut project_alias = "";
+    let mut path_str_repl = String::new();
+    if matches.is_present("name") {
+        project_alias = matches.value_of("name").unwrap();
+    }
+    else {
+        let path_str = path.to_str().unwrap().to_string();
+        path_str_repl = path_str.replace("\\", "/");
+        let path_split: Vec<&str> = path_str_repl.split("/").collect();
+        project_alias = path_split[path_split.len() - 1]
+    }
 
     let full_path = fs::canonicalize(&path)?;
     let full_path = full_path.to_str().unwrap();
     let sql = "INSERT INTO projects (path, alias) VALUES (?1, ?2)";
-    if let Err(_e) = db.execute(sql, params![full_path, matches.value_of("name")]) {
+    if let Err(_e) = db.execute(sql, params![full_path, project_alias]) {
         println!("ERROR: Project already exists at {}", full_path);
         return Ok(());
     }
@@ -397,20 +415,39 @@ fn remotes_delete(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn E
 
     Ok(())
 }
-fn sync_up(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
+fn sync_up(db: &Connection, matches: Option<&ArgMatches>, project: Option<String>, address: Option<String>) -> Result<(), Box<dyn Error>> {
     let filename = format!("{}", SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis());
     let tmp_file = format!("{}/{}.tar.gz", get_temp_path(), filename);
 
     let mut project_root: String = get_current_project("path", db, false)?;
     let mut project_name = get_current_project("name", db, true)?;
-    if matches.is_present("project") {
-        project_name = matches.value_of("project").unwrap().to_string();
+    let mut explicit = false;
+    if let Some(matches) = matches {
+        if matches.is_present("project") {
+            project_name = matches.value_of("project").unwrap().to_string();
+            let mut stmt = db.prepare("SELECT path FROM projects WHERE alias = ?1")?;
+            match stmt.query_row(params![project_name], |row| {
+                let tmp: String = row.get("path")?;
+                return Ok(tmp);
+            }) {
+                Ok(project_root_local) => {
+                    project_root = project_root_local;
+                },
+                Err(_) => {
+                    println!("ERROR: Project '{}' does not exist", project_name);
+                }
+            };
+        }
+    }
+    if let Some(project) = project {
+        project_name = project;
         let mut stmt = db.prepare("SELECT path FROM projects WHERE alias = ?1")?;
         match stmt.query_row(params![project_name], |row| {
             let tmp: String = row.get("path")?;
             return Ok(tmp);
         }) {
             Ok(project_root_local) => {
+                explicit = true;
                 project_root = project_root_local;
             },
             Err(_) => {
@@ -430,13 +467,27 @@ fn sync_up(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> 
 
 //    return Ok(());
 
-    let remote = matches.value_of("remote").unwrap();
-    println!("Connecting to '{}'", remote);
-    match server_remote_connect(db, remote.to_string()) {
+    let mut remote = "";
+    if !explicit {
+        remote = matches.unwrap().value_of("remote").unwrap();
+        println!("Connecting to '{}'", remote);
+    }
+    let mut port = None;
+    let mut address_calc = None;
+    if explicit {
+        port = Some(13932);
+        address_calc = address;
+    }
+
+    match server_remote_connect(db, remote.to_string(), port, address_calc) {
+        Err(e) => {
+            println!("ERROR: Could not connect to remote '{}' ({})", remote, get_remote_url_by_name(db, remote)?);
+            println!("{}", e);
+        }
         Ok(mut stream) => {
-            println!("Syncing project up...");
+            println!("Syncing '{}' up...", project_name);
             let mut archive_file = File::open(&tmp_file)?;
-            archive_file.sync_all()?;
+            let archive_meta = fs::metadata(&tmp_file)?;
             let filesize = archive_file.metadata()?.len();
 
             stream.write_all(&mut [1u8]);
@@ -482,31 +533,77 @@ fn sync_up(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> 
 
             println!("Sync completed");
         },
-        Err(_) => {
-            println!("ERROR: Could not connect to remote '{}' ({})", remote, get_remote_url_by_name(db, remote)?);
-        }
     }
 
-//    fs::remove_file(tmp_file);
+    fs::remove_file(tmp_file);
 
     Ok(())
 }
 fn sync_down(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
+    let mut project_root: String = get_current_project("path", db, false)?;
+    let mut project_name = get_current_project("name", db, true)?;
+    if matches.is_present("project") {
+        project_name = matches.value_of("project").unwrap().to_string();
+        let mut stmt = db.prepare("SELECT path FROM projects WHERE alias = ?1")?;
+        match stmt.query_row(params![project_name], |row| {
+            let tmp: String = row.get("path")?;
+            return Ok(tmp);
+        }) {
+            Ok(project_root_local) => {
+                project_root = project_root_local;
+            },
+            Err(_) => {
+                println!("ERROR: Project '{}' does not exist", project_name);
+            }
+        };
+    }
+    println!("Syncing '{}' down...", project_name);
+    let remote = matches.value_of("remote").unwrap();
+    server_start(db, matches, 13932, true, || {
+        match server_remote_connect(db, remote.to_string(), None, None) {
+            Err(_) => {
+                println!("ERROR: Could not connect to remote '{}' ({})", remote, get_remote_url_by_name(db, remote).unwrap());
+            }
+            Ok(mut stream) => {
+                stream.write_all(&mut [2u8]);
+
+                let mut project_name_arr = project_name.as_bytes();
+
+                let mut project_name_len_arr = &mut [0u8; 4];
+                project_name_len_arr.write_with::<u32>(&mut 0, project_name_arr.len() as u32, BE).unwrap();
+                stream.write_all(project_name_len_arr);
+                stream.write_all(project_name_arr);
+            },
+        }
+    })?;
+
     Ok(())
 }
-fn server_start(db: &Connection, matches: &ArgMatches) -> Result<(), Box<dyn Error>> {
-    let listener = TcpListener::bind("0.0.0.0:13931")?;
-    let db_arc = Arc::new(Mutex::new(db));
+fn server_start<F: FnOnce()>(db: &Connection, matches: &ArgMatches, listen_port: u16, single_client: bool, start_callback: F) -> Result<(), Box<dyn Error>> {
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", listen_port)).unwrap();
+    start_callback();
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let addr = stream.peer_addr()?;
-                println!("{} established", addr);
-                thread::spawn(move|| {
+                let addr = stream.peer_addr().unwrap();
+                if !single_client {
+                    println!("{} established", addr);
+                }
+                let handle = thread::spawn(move|| {
                     let db_local = Connection::open(format!("{}/.nick/nick.db", dirs::home_dir().unwrap().to_str().unwrap())).unwrap();
-                    handle_server_client(&db_local, stream);
-                    println!("{} closed", addr);
+                    handle_server_client(&db_local, stream, &addr);
+
+                    if single_client {
+                        println!("Sync completed");
+                    }
+                    else {
+                        println!("{} closed", addr);
+                    }
                 });
+                if single_client {
+                    handle.join();
+                    std::process::exit(0);
+                }
             }
             Err(e) => {
                 println!("ERROR: Connection to client failed: {}", e);
@@ -562,15 +659,15 @@ Send:
 fn handle_server_stream_close(mut stream: TcpStream) {
     stream.shutdown(Shutdown::Both).unwrap();
 }
-fn handle_server_client(db: &Connection, mut stream: TcpStream) {
+fn handle_server_client(db: &Connection, mut stream: TcpStream, address: &SocketAddr) {
     let mut command = [0 as u8; 1];
     match stream.read_exact(&mut command) {
         Ok(_) => {
-            println!("COMMAND: {:?}", command);
+//            println!("COMMAND: {:?}", command);
             let result = match command[0] {
                 0 => handle_server_status(db, stream),
                 1 => handle_server_sync_up(db, stream),
-                2 => handle_server_sync_down(db, stream),
+                2 => handle_server_sync_down(db, stream, address),
                 _ => {
                     stream.write(&[1 as u8]).unwrap();
                     Ok(())
@@ -681,8 +778,8 @@ fn handle_server_sync_up(db: &Connection, mut stream: TcpStream) -> Result<(), B
     fs::remove_dir_all(&project_path).unwrap_or(());
     fs::create_dir_all(&project_path).unwrap_or(());
 
-    println!("TMP FILE: {}", tmp_file);
-    println!("PROJECT PATH: {}", project_path);
+//    println!("TMP FILE: {}", tmp_file);
+//    println!("PROJECT PATH: {}", project_path);
 
     let out_file2 = File::open(&tmp_file)?;
     let decoder = GzDecoder::new(out_file2);
@@ -694,7 +791,18 @@ fn handle_server_sync_up(db: &Connection, mut stream: TcpStream) -> Result<(), B
 
     Ok(())
 }
-fn handle_server_sync_down(db: &Connection, mut stream: TcpStream) -> Result<(), Box<dyn Error>> {
+fn handle_server_sync_down(db: &Connection, mut stream: TcpStream, address: &SocketAddr) -> Result<(), Box<dyn Error>> {
+    let project_name_len_arr = &mut [0u8; 4];
+    stream.read_exact(project_name_len_arr)?;
+    let project_name_len = project_name_len_arr.read_with::<u32>(&mut 0, BE).unwrap();
+
+    let mut project_name_arr = vec![0u8; project_name_len as usize];
+    let project_name_arr = project_name_arr.as_mut_slice();
+    stream.read_exact(project_name_arr)?;
+    let project_name = std::str::from_utf8(project_name_arr)?;
+
+    sync_up(db, None, Some(project_name.to_string()), Some(format!("{}", address.ip())));
+
     Ok(())
 }
 fn get_current_project(prop: &str, db: &Connection, suppress_warnings: bool) -> Result<String, Box<dyn Error>> {
@@ -740,9 +848,19 @@ fn get_current_project(prop: &str, db: &Connection, suppress_warnings: bool) -> 
         _ => return Ok(lowest_parent_id.to_string())
     }
 }
-fn server_remote_connect(db: &Connection, remote: String) -> Result<TcpStream, Box<dyn Error>> {
-    let url = get_remote_url_by_name(db, remote.as_str())?;
-    match TcpStream::connect(format!("{}:13931", url)) {
+fn server_remote_connect(db: &Connection, remote: String, port: Option<u16>, address: Option<String>) -> Result<TcpStream, Box<dyn Error>> {
+    let mut url = String::new();
+    let mut real_port = 13931;
+    match address {
+        Some(addr) => {
+            url = addr;
+            real_port = port.unwrap();
+        },
+        None => {
+            url = get_remote_url_by_name(db, remote.as_str())?;
+        }
+    }
+    match TcpStream::connect(format!("{}:{}", url, real_port)) {
         Ok(mut stream) => {
             return Ok(stream);
         },
